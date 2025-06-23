@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>WhatsApp QR Viewer</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      padding: 50px;
+    }
+
+    img {
+      border: 1px solid #ccc;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Scan QR WhatsApp</h1>
+  <input type="text" id="session-id" placeholder="Session ID" value="client-one">
+  <button onclick="connect()">Connect</button>
+  <div id="qr-box"></div>
+
+  <script>
+    let socket;
+
+    function connect() {
+      const sessionId = document.getElementById('session-id').value;
+      socket = new WebSocket(`ws://localhost:3000?id=${sessionId}`);
+
+      socket.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log(event)
+        if (msg.type === 'qr') {
+          document.getElementById('qr-box').innerHTML = `<img src="${msg.data}" width="300" height="300" />`;
+        }
+      };
+
+      socket.onopen = () => {
+        document.getElementById('qr-box').innerText = 'Waiting for QR...';
+
+        fetch(`http://localhost:3000/session/${sessionId}/json`, {
+          headers: {
+            'Accept': 'application/json'
+          }
+        })
+          .then(res => {
+            if (!res.ok) {
+              throw new Error(`HTTP error! status: ${res.status}`);
+            }
+            return res.json();
+          })
+          .then(data => {
+            console.log("API response:", data);
+            if (data.qr) {
+              document.getElementById('qr-box').innerHTML = `<img src="${data.qr}" width="300" height="300" />`;
+            } else if (data.status === 'authenticated') {
+              document.getElementById('qr-box').innerText = 'Already Authenticated';
+            } else {
+              document.getElementById('qr-box').innerText = 'Initializing...';
+            }
+          })
+          .catch(err => {
+            console.error('API error:', err);
+            document.getElementById('qr-box').innerText = 'Error fetching QR';
+          });
+
+      };
+
+      socket.onerror = (err) => {
+        console.error('WebSocket error:', err);
+      };
+    }
+  </script>
+</body>
+
+</html>
