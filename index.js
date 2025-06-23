@@ -13,9 +13,11 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const sendQueue = [];
+const sendQueueClients = {};
 
 app.use(express.json());
-const allowedOrigins = ['https://dashboard.importpartner.id', 'http://localhost:8000'];
+const allowedOrigins = ['https://dashboard.importpartner.id', 'http://localhost:4000'];
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -68,24 +70,24 @@ function createClient(sessionId) {
   });
 
   client.on('ready', async () => {
-    if (sessionSaved[sessionId]) return; // ⛔ skip kalau sudah disimpan
+    // ✅ Cek & Simpan ke DB satu kali
+    if (!sessionSaved[sessionId]) {
+      const number = client.info?.wid?.user;
+      if (number) {
+        try {
+          await knex('wa_sessions')
+            .insert({ session_id: sessionId, number })
+            .onConflict('session_id')
+            .merge();
 
-    const number = client.info?.wid?.user;
-    if (number) {
-      try {
-        await knex('wa_sessions')
-          .insert({ session_id: sessionId, number })
-          .onConflict('session_id')
-          .merge();
-
-        sessionSaved[sessionId] = true; // ✅ tandai sudah disimpan
-        console.log(`[${sessionId}] saved to DB: ${number}`);
-      } catch (err) {
-        console.error(`[${sessionId}] DB error`, err);
+          sessionSaved[sessionId] = true;
+          console.log(`[${sessionId}] saved to DB: ${number}`);
+        } catch (err) {
+          console.error(`[${sessionId}] DB error`, err);
+        }
       }
 
       qrCodes[sessionId] = null;
-
       const sockets = qrSocketClients[sessionId] || [];
       sockets.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -93,7 +95,40 @@ function createClient(sessionId) {
         }
       });
     }
+    console.log("sending message")
+    // ✅ Tetap proses sendQueue meskipun session sudah disimpan
+    const queued = sendQueue[sessionId] || [];
+    for (const item of queued) {
+      const recipient = `${item.to}@c.us`;
+      let status = 'sent';
+      console.log(`Start process to Send message to ${recipient}`)
+      try {
+        if (item.type === 'text') {
+          await client.sendMessage(recipient, item.message);
+        } else if (item.type === 'image') {
+          const media = await MessageMedia.fromUrl(item.url);
+          await client.sendMessage(recipient, media, { caption: item.caption });
+        } else if (item.type === 'button') {
+          const btn = new Buttons(item.message, [{ body: 'Click Here' }], 'Title', 'Footer');
+          await client.sendMessage(recipient, btn);
+        }
+
+      } catch (err) {
+        console.error(`❌ Failed to send to ${recipient}:`, err);
+        status = 'failed';
+      }
+
+      const sockets = qrSocketClients[sessionId] || [];
+      sockets.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'send-result', to: item.to, status }));
+        }
+      });
+    }
+
+    sendQueue[sessionId] = [];
   });
+
 
 
   client.on('disconnected', () => {
@@ -108,19 +143,76 @@ function createClient(sessionId) {
   return client;
 }
 
+async function processSendQueue(sessionId) {
+  const client = sessions[sessionId];
+  if (!client || !client.info?.wid) return; // pastikan client ready
+
+  const queued = sendQueue[sessionId] || [];
+  for (const item of queued) {
+    const recipient = `${item.to}@c.us`;
+    let status = 'sent';
+
+    try {
+      if (item.type === 'text') {
+        await client.sendMessage(recipient, item.message);
+      } else if (item.type === 'image') {
+        const media = await MessageMedia.fromUrl(item.url);
+        await client.sendMessage(recipient, media, { caption: item.caption });
+      } else if (item.type === 'button') {
+        const btn = new Buttons(item.message, [{ body: 'Click Here' }], 'Title', 'Footer');
+        await client.sendMessage(recipient, btn);
+      }
+    } catch (err) {
+      console.error(`❌ Failed to send to ${recipient}:`, err);
+      status = 'failed';
+    }
+
+    const sockets = qrSocketClients[sessionId] || [];
+    sockets.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'send-result', to: item.to, status }));
+      }
+    });
+  }
+
+  sendQueue[sessionId] = []; // kosongkan queue
+}
+
+
+function waitForClientReady(client) {
+
+  return new Promise((resolve) => {
+    if (client.isReady) {
+      return resolve();
+    }
+    client.once('ready', () => {
+      client.isReady = true;
+      resolve();
+    });
+  });
+}
+
 // WebSocket endpoint
 wss.on('connection', (ws, req) => {
   const params = new URLSearchParams(req.url.replace('/?', ''));
-  console.warn({ params })
+
   const sessionId = params.get('id');
+  const actionId = params.get('action') ?? "";
 
   if (!qrSocketClients[sessionId]) qrSocketClients[sessionId] = [];
   qrSocketClients[sessionId].push(ws);
+
+  if (!sendQueueClients[sessionId]) sendQueueClients[sessionId] = [];
+  sendQueueClients[sessionId].push(ws);
+
 
   // cleanup when socket closes
   ws.on('close', () => {
     qrSocketClients[sessionId] = qrSocketClients[sessionId]?.filter(s => s !== ws);
     if (qrSocketClients[sessionId] && qrSocketClients[sessionId].length === 0) delete qrSocketClients[sessionId];
+
+    sendQueueClients[sessionId] = sendQueueClients[sessionId]?.filter(s => s !== ws);
+    if (sendQueueClients[sessionId] && sendQueueClients[sessionId].length === 0) delete sendQueueClients[sessionId];
   });
 });
 
@@ -167,26 +259,35 @@ app.delete('/session/:id', async (req, res) => {
 // 3. Send message
 app.post('/send/:id', async (req, res) => {
   const { id } = req.params;
-  const { to, type, message, url, filename, caption } = req.body;
-  const client = sessions[id];
+  console.log(req.body)
+  let type = req.body?.type ?? "";
 
+  let to = req.body.to ?? 0;
+  let message = req.body.message ?? "";
+  let url = req.body.url ?? null;
+  let filename = req.body.filename ?? null;
+  let caption = req.body.caption ?? null;
+
+
+
+
+  const client = createClient(id); // trigger init kalau belum ada
   if (!client) return res.status(404).json({ error: 'Session not found' });
 
-  try {
-    if (type === 'text') {
-      await client.sendMessage(to, message);
-    } else if (type === 'image') {
-      const media = await MessageMedia.fromUrl(url);
-      await client.sendMessage(to, media, { caption });
-    } else if (type === 'button') {
-      const btn = new Buttons(message, [{ body: 'Click Here' }], 'Title', 'Footer');
-      await client.sendMessage(to, btn);
-    }
-    res.json({ status: 'sent' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  const payload = { to, type, message, url, filename, caption };
+
+  // Simpan ke queue
+  if (!sendQueue[id]) sendQueue[id] = [];
+  sendQueue[id].push(payload);
+
+  res.json({ status: 'queued' });
+
+  // 🚀 Proses langsung jika sudah ready
+  if (client.info?.wid) {
+    await processSendQueue(id);
   }
 });
+
 
 // 4. Broadcast queue
 app.post('/broadcast/:id', (req, res) => {

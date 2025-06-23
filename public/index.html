@@ -18,23 +18,91 @@
 </head>
 
 <body>
-  <h1>Scan QR WhatsApp</h1>
-  <input type="text" id="session-id" placeholder="Session ID" value="client-one">
-  <button onclick="connect()">Connect</button>
-  <div id="qr-box"></div>
+  <div>
+    <h1>Scan QR WhatsApp</h1>
+    <input type="text" id="session-id" placeholder="Session ID" value="client-one">
+    <button onclick="connect()">Connect</button>
+    <div id="qr-box"></div>
+  </div>
+  <hr>
+  <div>
+    <h1>Send Message</h1>
+    <input type="text" id="recipient" placeholder="Target Pengiriman">
+    <input type="text" id="message" placeholder="Pesan">
+    <button onclick="sendMessage()">Kirim</button>
+    <div id="log-message"></div>
+  </div>
 
   <script>
     let socket;
+    const logMessage = document.querySelector("#log-message");
 
-    function connect() {
+    const sendMessage = async () => {
+       const message = document.querySelector("#message").value;
+          const recipient = document.querySelector("#recipient").value;
+
+      logMessage.innerHTML += `<p>Message to ${recipient} is queued<br><hr>`;
       const sessionId = document.getElementById('session-id').value;
-      socket = new WebSocket(`ws://localhost:3000?id=${sessionId}`);
+      socket = new WebSocket(`ws://localhost:3000?id=${sessionId}&action=send`);
+
+      socket.onopen = async () => {
+        
+        try {
+         
+
+          const req = await fetch(`http://localhost:3000/send/${sessionId}`, {
+            method: 'POST',
+            headers: {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json' // ← tambahkan ini
+            },
+            body: JSON.stringify({
+              to: recipient,
+              type: 'text',
+              message: message
+            })
+          })
+
+          const response = await req.json();
+
+          console.log(response)
+
+          if (response.status == 'queued') {
+            logMessage.innerHTML += `<p>Pesan ke ${recipient} sedang dikirim!</p>`;
+          }
+
+        } catch (error) {
+          console.log(error)
+          logMessage.innerHTML += `<p>Terjadi kesalahan! Pesan ke ${recipient} tidak akan dikirim!</p>`;
+        }
+      }
+
+      socket.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type == 'send-result') {
+          logMessage.innerHTML += `<p>Message to ${msg.to} is ${msg.status}</p>`;
+        }
+      };
+
+      socket.onerror = (err) => {
+        console.error('WebSocket error:', err);
+         logMessage.innerHTML += `<p>Message to ${msg.to} is not sent!</p>`;
+      };
+
+
+    }
+
+    function connect(action = '') {
+      const sessionId = document.getElementById('session-id').value;
+      socket = new WebSocket(`ws://localhost:3000?id=${sessionId}${action != '' ? '&action='.action : ''}`);
 
       socket.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         console.log(event)
         if (msg.type === 'qr') {
           document.getElementById('qr-box').innerHTML = `<img src="${msg.data}" width="300" height="300" />`;
+        } else if (msg.type == 'send-result') {
+          logMessage.innerHTML += `<p>Message to ${msg.to} is ${msg.status}<br><hr>`;
         }
       };
 
@@ -66,6 +134,7 @@
             console.error('API error:', err);
             document.getElementById('qr-box').innerText = 'Error fetching QR';
           });
+
 
       };
 
